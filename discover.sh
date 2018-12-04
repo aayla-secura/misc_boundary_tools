@@ -16,19 +16,61 @@ ANSI_DEBUG="${ANSI_BLUE}"
 ANSI_INFO="${ANSI_WHITE}${ANSI_BOLD}"
 ANSI_WARNING="${ANSI_YELLOW}${ANSI_BOLD}"
 ANSI_ERROR="${ANSI_RED}${ANSI_BOLD}"
+ANSI_PROMPT="${ANSI_CYAN}"
+
+DEBUG=3
+INFO=2
+WARNING=1
+ERROR=0
+PROMPT=-1   # always print
+VERBOSITY=2 # max level printed
+
+function usage {
+    cat <<EOF
+${ANSI_INFO}Usage:${ANSI_RESET}
+    ${ANSI_WHITE}${BASH_SOURCE[0]} ${ANSI_CYAN}[<options>] ${ANSI_GREEN}<targets_file>
+
+${ANSI_INFO}Arguments:${ANSI_RESET}
+   ${ANSI_GREEN}<targets_file>${ANSI_RESET}  A comma-separated file containing one DNS name,IP address per line
+
+${ANSI_INFO}Misc options:${ANSI_RESET}
+    ${ANSI_CYAN}-D <directory>${ANSI_RESET}  Directory containing files from previous run
+    ${ANSI_CYAN}-d${ANSI_RESET}              Enable debugging output
+
+${ANSI_INFO}Nmap options:${ANSI_RESET}
+
+    ${ANSI_CYAN}-T  <ports>${ANSI_RESET}     Scan the given TCP port range.
+    ${ANSI_CYAN}-U  <ports>${ANSI_RESET}     Scan the given UDP port range.
+    ${ANSI_CYAN}-tT <ports>${ANSI_RESET}     Scan the <n> most common TCP ports.
+    ${ANSI_CYAN}-tU <ports>${ANSI_RESET}     Scan the <n> most common UDP ports.
+
+  Default is all TCP ports and top 100 UDP ports.
+EOF
+exit 1
+}
 
 function to_bool {
-    local arg="$1" func="$2"
+    local arg="$1"
     if [[ -n "${arg}" && ! "${arg}" =~ ^[01]$ ]] ; then
-        log ERROR "Expected 0 or 1 as second argument to ${func}, got '${arg}'" >&2
+        log ERROR "Expected 0 or 1, got '${arg}'" >&2
         exit 1
     fi
     echo -n "${arg:-0}"
 }
 
+function to_posnum {
+    local arg="$1"
+    if [[ -n "${arg}" && ! "${arg}" =~ ^[0-9]+$ ]] ; then
+        log ERROR "Expected a positive number, got '${arg}'" >&2
+        exit 1
+    fi
+    echo -n "${arg}"
+}
+
+
 function prompt {
-    local level="$1" var="$2" msg="$3" yesno=$(to_bool "$4" prompt)
-    print "${level}" "         ${msg} "
+    local var="$1" msg="$2" yesno=$(to_bool "$3") level="PROMPT"
+    print "${level}" "\\n         ${msg} "
     if [[ "${yesno}" -eq 0 ]] ; then
         read "${var}"
     else
@@ -38,7 +80,7 @@ function prompt {
         while [[ ! "${!var}" =~ [yYnN] ]] ; do
             print "${level}" "         Answer with 'y' or 'n': "
             read -n1 "${var}"
-            print "${level}" '\n'
+            print "${level}" '\n\n'
         done
     fi
 }
@@ -50,6 +92,7 @@ function log {
 
 function print {
     local level="$1" msg="$2" color="ANSI_${level}"
+    [[ "${!level}" -le "${VERBOSITY}" ]] || return
     echo -ne "${!color}${msg}${ANSI_RESET}"
 }
 
@@ -64,7 +107,7 @@ function get_one_above_tlds {
 
 function get_topmost_match_domain {
     # read from stdin
-    local re match="$1" exact=$(to_bool "$2" get_topmost_match_domain)
+    local re match="$1" exact=$(to_bool "$2")
     if [[ "${exact}" -eq 0 ]] ; then
         re='[^\.]*'"${match}"'[^\.]*'
     else
@@ -86,12 +129,74 @@ MAILTO='a.nikolova@aurainfosec.com'
 SLDS='ac|biz|co?|edu?|go?v|mil|net|nom|org?'
 
 DATE=$(date +"%d_%m_%Y__%H_%M_%S" | tr -d '\n')
-WDIR="${2:-discover_${DATE}}"
-[[ -d "${WDIR}" ]] || mkdir "${WDIR}" || exit $?
 
-TARGETS="${1:-targets.csv}"
+# DEFAULTS
+NMAP_TCP_OPTS=(-p 1-65535)
+NMAP_UDP_OPTS=(--top-ports 100)
+
+while [[ $# -gt 0 ]] ; do
+    case $1 in
+        -T*|-U*|-tT*|-tU*)
+            opt="${1#-}"
+            if [[ "${opt}" == t* ]] ; then
+                range_type="--top-ports"
+                opt="${opt#t}"
+            else
+                range_type="-p"
+            fi
+
+            [[ ${opt:0:1} == 'T' ]] && arr="NMAP_TCP_OPTS" || arr="NMAP_UDP_OPTS"
+
+            ports="${opt:1}"
+            if [[ -z "${ports}" ]] ; then
+                ports="$2"
+                shift
+            fi
+            if [[ ! "${ports}" =~ ^[0-9,\ -]+$ ]] ; then
+                log ERROR "Invalid port range '${ports}'"
+                usage
+            fi
+
+            typeset -a ${arr}="(${range_type} '${ports}')"
+            ;;
+        -D)
+            WDIR="${1:2}"
+            if [[ -z "${WDIR}" ]] ; then
+                WDIR="$2"
+                shift
+            fi
+            ;;
+        -d)
+            VERBOSITY="${DEBUG}"
+            ;;
+        -h)
+            usage
+            ;;
+        -*)
+            log ERROR "Unknown option $1" >&2
+            usage
+            ;;
+        *)
+
+            if [[ -n "${TARGETS}" ]] ; then
+                log ERROR "Extra argument $1" >&2
+                usage
+            fi
+            TARGETS="$1"
+            ;;
+    esac
+    shift
+done
+
+[[ -n "${TARGETS}" ]] || usage
 TARGETS=$(python -c "import os,sys; print os.path.abspath(sys.argv[1])" "${TARGETS}")
-[[ -f "${TARGETS}" ]] || exit 1 #TODO error
+if [[ ! -f "${TARGETS}" ]] ; then
+    log ERROR "No such file '${TARGETS}'"
+    exit 1
+fi
+
+WDIR="${WDIR:-discover_${DATE}}"
+[[ -d "${WDIR}" ]] || mkdir "${WDIR}" || exit $?
 cd "${WDIR}"
 
 NMAP_LOG="nmap_default_scripts.log"
@@ -104,7 +209,7 @@ NMAP_TARGETS="nmap_targets.txt"
 if [[ ! -f "${AQUATONE_TARGETS}" ]] ; then
     cut -d, -f1 "${TARGETS}" | get_one_above_tlds > "${AQUATONE_TARGETS}"
     log INFO "Targets for Aquatone saved to ${AQUATONE_TARGETS}."
-    prompt INFO ignored "Edit as needed, then press Enter to proceed"
+    prompt ignored "Edit as needed, then press Enter to proceed"
 fi
 
 #TODO option to add /<n> for every IP
@@ -112,19 +217,24 @@ fi
 if [[ ! -f "${NMAP_TARGETS}" ]] ; then
     cut -d, -f2 "${TARGETS}" | sort -u > "${NMAP_TARGETS}"
     log INFO "Targets for Nmap saved to ${NMAP_TARGETS}."
-    prompt INFO ignored "Edit as needed, then press Enter to proceed"
+    prompt ignored "Edit as needed, then press Enter to proceed"
 fi
 
 ### NMAP
 touch "${NMAP_LOG}"
-prompt INFO proceed "Proceed with the TCP scan?" 1
+log DEBUG "Scanning opts: ${NMAP_TCP_OPTS[*]}"
+prompt proceed "Proceed with the TCP scan?" 1
 if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
-    sudo nmap -p1-65535 -v -sC -Pn -sV -O $(< "${NMAP_TARGETS}") 2>&1 >> "${NMAP_LOG}" || \
-        nmap -p1-65535 -v -sC -Pn -sV $(< "${NMAP_TARGETS}") 2>&1 >> "${NMAP_LOG}" || exit $?
+    sudo nmap "${NMAP_TCP_OPTS[@]}" -v -sC -Pn -sV -O $(< "${NMAP_TARGETS}") \
+        2>&1 >> "${NMAP_LOG}" || \
+            nmap "${NMAP_TCP_OPTS[@]}" -v -sC -Pn -sV $(< "${NMAP_TARGETS}") \
+                2>&1 >> "${NMAP_LOG}" || exit $?
 fi
-prompt INFO proceed "Proceed with the UDP scan?" 1
+log DEBUG "Scanning opts: ${NMAP_UDP_OPTS[*]}"
+prompt proceed "Proceed with the UDP scan?" 1
 if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
-    sudo nmap --top-ports 100 -v -sU -Pn $(< "${NMAP_TARGETS}") 2>&1 >> "${NMAP_LOG}" || exit $?
+    sudo nmap "${NMAP_UDP_OPTS[@]}" -v -sU -Pn $(< "${NMAP_TARGETS}") \
+        2>&1 >> "${NMAP_LOG}" || exit $?
 fi
 
 egrep '^Nmap scan report|/(tcp|udp).*open' "${NMAP_LOG}" >> "${NMAP_SHORT_LOG}"
@@ -138,7 +248,7 @@ sed -n -E 's/^Nmap scan report for.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\)?$|^
         if [[ -n "${ip}" ]] ; then
             cur_ip="${ip}"
         else
-            # log DEBUG "${proto} service ${service} is ${state} on ${cur_ip}:${port}"
+            log DEBUG "${proto} service ${service} is ${state} on ${cur_ip}:${port}"
             state="${state//\//_}"
             service="${service//\//_}"
             service="${service//\?/}"
@@ -154,7 +264,7 @@ done
 
 ### SSL
 #TODO other SSL services, inspect with openssl s_client
-prompt INFO proceed "Proceed with the SSL scan?" 1
+prompt proceed "Proceed with the SSL scan?" 1
 if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
     cat services/ssl_* 2>/dev/null | while IFS=: read ip port ; do
         for host in $(get_dns_names "${ip}") ; do
@@ -173,7 +283,7 @@ if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
 fi
 
 ### FTP
-prompt INFO proceed "Proceed with the FTP phase?" 1
+prompt proceed "Proceed with the FTP phase?" 1
 if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
     if [[ -f services/ftp_open.txt ]] ; then
         while IFS=: read ip port ; do
@@ -188,7 +298,7 @@ if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
 fi
 
 ### AQUATONE
-prompt INFO proceed "Proceed with the Aquatone phase?" 1
+prompt proceed "Proceed with the Aquatone phase?" 1
 if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
     # for host in $(< "${AQUATONE_TARGETS}") ; do
     #     aquatone-discover -d "${host}" || exit $?
@@ -205,7 +315,7 @@ if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
 fi
 
 ### SSH
-prompt INFO proceed "Proceed with the ssh phase?" 1
+prompt proceed "Proceed with the ssh phase?" 1
 if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
     if [[ -f services/ssh_open.txt ]] ; then
         while IFS=: read ip port ; do
@@ -218,7 +328,7 @@ if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
 fi
 
 ### SMTP
-prompt INFO proceed "Proceed with the smtp phase?" 1
+prompt proceed "Proceed with the smtp phase?" 1
 if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
     while IFS=: read -u3 ip port ; do
         for host in $(get_dns_names "${ip}") ; do
@@ -229,7 +339,7 @@ if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
                 host="${host#*.}"
             fi
             [[ -f "sendEmail_${ip}_${port}.log" ]] && continue
-            prompt INFO proceed "Send email from aurainfosec-demo@${host} (port ${port})?" 1
+            prompt proceed "Send email from aurainfosec-demo@${host} (port ${port})?" 1
             [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] || continue
             sendEmail -s "${host}:${port}" \
                 -o timeout=20 \
