@@ -2,6 +2,15 @@
 # targets should be a csv: DNS name,IP address
 # needs testssl.sh, sslscan, nmap, sendEmail
 
+MAILTO='user@example.com' # UPDATE THIS
+
+# regularly updated list of valid TLDs and their own SLDs at
+# https://publicsuffix.org/list/public_suffix_list.dat
+# but the below should be enough in most cases
+SLDS='ac|biz|co?|edu?|go?v|mil|net|nom|org?'
+
+DATE=$(date +"%d_%m_%Y__%H_%M_%S" | tr -d '\n')
+
 ANSI_RED=$'\e[31m'
 ANSI_GREEN=$'\e[32m'
 ANSI_YELLOW=$'\e[33m'
@@ -122,13 +131,126 @@ function get_dns_names {
     grep "${ip}" "${TARGETS}" | cut -d, -f1
 }
 
-MAILTO='a.nikolova@aurainfosec.com'
-# regularly updated list of valid TLDs and their own SLDs at
-# https://publicsuffix.org/list/public_suffix_list.dat
-# but the below should be enough in most cases
-SLDS='ac|biz|co?|edu?|go?v|mil|net|nom|org?'
+function scan_tcp {
+    sudo nmap "${NMAP_TCP_OPTS[@]}" -v -sC -Pn -sV -O $(< "${NMAP_TARGETS}") \
+        2>&1 >> "${NMAP_LOG}" || \
+            nmap "${NMAP_TCP_OPTS[@]}" -v -sC -Pn -sV $(< "${NMAP_TARGETS}") \
+                2>&1 >> "${NMAP_LOG}" || exit $?
+}
 
-DATE=$(date +"%d_%m_%Y__%H_%M_%S" | tr -d '\n')
+function scan_udp {
+    sudo nmap "${NMAP_UDP_OPTS[@]}" -v -sU -Pn $(< "${NMAP_TARGETS}") \
+        2>&1 >> "${NMAP_LOG}" || exit $?
+}
+
+function process_nmap_log {
+    egrep '^Nmap scan report|/(tcp|udp).*open' "${NMAP_LOG}" > "${NMAP_SHORT_LOG}"
+    egrep -o 'DNS:[^ ,]+' "${NMAP_LOG}" | cut -d: -f2 | sort -u > dns_names_from_ssl_certs.txt
+    new_targets=$(comm -13 "${TARGETS}" dns_names_from_ssl_certs.txt)
+    if [[ -n "${new_targets}" ]] ; then
+        log INFO "Discovered the following new DNS names in SSL certificates:\\n${new_targets}"
+    fi
+
+    [[ -d services ]] || mkdir services || exit $?
+    [[ -d ports ]] || mkdir ports || exit $?
+    rm ports/*.txt services/*.txt
+    sed -n -E 's/^Nmap scan report for.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\)?$|^([0-9]+)\/(tcp|udp) +([^ ]+) +([^ ]+).*/\1,\2,\3,\4,\5/p' \
+        "${NMAP_SHORT_LOG}" | while IFS=, read ip port proto state service ; do
+            if [[ -n "${ip}" ]] ; then
+                cur_ip="${ip}"
+            else
+                log DEBUG "${proto} service ${service} is ${state} on ${cur_ip}:${port}"
+                state="${state//\//_}"
+                service="${service//\//_}"
+                service="${service//\?/}"
+                echo "${cur_ip}" >> "ports/${proto}_${state}_${port}.txt" 
+                echo "${cur_ip}:${port}" >> "services/${service}_${state}.txt" 
+            fi
+        done
+
+    for f in services/*.txt ports/*.txt ; do
+        sort -u "${f}" > "${f/.txt/..txt}"
+        mv "${f/.txt/..txt}" "${f}"
+    done
+}
+
+function scan_ssl {
+    cat services/ssl_* 2>/dev/null | while IFS=: read ip port ; do
+        for host in $(get_dns_names "${ip}") ; do
+            if [[ ! -f "testssl_${host}_${port}.log" ]] ; then
+                testssl.sh "${host}:${port}" > "testssl_${host}_${port}.log"
+            fi
+            if [[ ! -f "sslscan_${host}_${port}.log" ]] ; then
+                sslscan "${host}:${port}" > "sslscan_${host}_${port}.log"
+            fi
+            if [[ ! -f "sslenumciphers_${host}_${port}.log" ]] ; then
+                nmap -p "${port}" -Pn --script sslv2,ssl-enum-ciphers "${host}" \
+                    > "sslenumciphers_${host}_${port}.log"
+            fi
+        done
+    done
+}
+
+function scan_ftp {
+    if [[ -f services/ftp_open.txt ]] ; then
+        while IFS=: read ip port ; do
+            #TODO other users passes, use a dictionary
+            for user in ftp anonymous ; do
+                lftp -p "${port}" -u "${user}","" "${ip}" \
+                    < <(echo -e "set ssl:verify-certificate false\nls") \
+                    &> "lftp_${ip}_${port}.log"
+            done
+        done < services/ftp_open.txt
+    fi
+}
+
+function scan_ssh {
+    if [[ -f services/ssh_open.txt ]] ; then
+        while IFS=: read ip port ; do
+            log DEBUG "Getting SSH info for ${ip} on port ${port}"
+            ssh aura@"${ip}" -vvv -fnN \
+                -o StrictHostKeyChecking=no \
+                -o BatchMode=yes &> "ssh_${ip}_${port}.log"
+        done < services/ssh_open.txt
+    fi
+}
+
+function scan_smtp {
+    while IFS=: read -u3 ip port ; do
+        for host in $(get_dns_names "${ip}") ; do
+            [[ "${host+1}" == '1' ]] && continue # already done
+            declare ${host}=done
+            if [[ "${host}" == mail*.* ]] ; then
+                log DEBUG "Stripping ${host%%.*} from host"
+                host="${host#*.}"
+            fi
+            [[ -f "sendEmail_${ip}_${port}.log" ]] && continue
+            prompt proceed "Send email from aurainfosec-demo@${host} (port ${port})?" 1
+            [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] || continue
+            sendEmail -s "${host}:${port}" \
+                -o timeout=20 \
+                -f 'Aura Infosec PenTest <aurainfosec-demo@'"${host}"'>' \
+                -t "${MAILTO}" -u 'Test message' -m 'Test message' \
+                    &> "sendEmail_${ip}_${port}.log"
+            echo
+        done
+    done 3< <(cat services/smtp_open.txt 2>/dev/null)
+}
+
+function scan_with_aquatone {
+    for host in $(< "${AQUATONE_TARGETS}") ; do
+        aquatone-discover -d "${host}" || exit $?
+    done
+    open_ports=$(sed -n -E 's/^Discovered open port ([0-9]+)\/tcp .*/\1/p' "${NMAP_LOG}" | sort -u | tr '\n' ,)
+    open_ports="${open_ports%,}"
+    #XXX what if no open ports
+    for host in $(< "${AQUATONE_TARGETS}") ; do
+        aquatone-scan -d "${host}" -p "${open_ports}" 2>&1 >> "${AQUATONE_LOG}" || exit $?
+    done
+    for host in $(< "${AQUATONE_TARGETS}") ; do
+        aquatone-gather -d "${host}" 2>&1 >> "${AQUATONE_LOG}" || exit $?
+    done
+}
 
 # DEFAULTS
 NMAP_TCP_OPTS=(-p 1-65535)
@@ -222,131 +344,33 @@ fi
 
 ### NMAP
 touch "${NMAP_LOG}"
-log DEBUG "Scanning opts: ${NMAP_TCP_OPTS[*]}"
+
+log DEBUG "TCP scanning opts: ${NMAP_TCP_OPTS[*]}"
 prompt proceed "Proceed with the TCP scan?" 1
-if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
-    sudo nmap "${NMAP_TCP_OPTS[@]}" -v -sC -Pn -sV -O $(< "${NMAP_TARGETS}") \
-        2>&1 >> "${NMAP_LOG}" || \
-            nmap "${NMAP_TCP_OPTS[@]}" -v -sC -Pn -sV $(< "${NMAP_TARGETS}") \
-                2>&1 >> "${NMAP_LOG}" || exit $?
-fi
-log DEBUG "Scanning opts: ${NMAP_UDP_OPTS[*]}"
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_tcp
+
+log DEBUG "UDP scanning opts: ${NMAP_UDP_OPTS[*]}"
 prompt proceed "Proceed with the UDP scan?" 1
-if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
-    sudo nmap "${NMAP_UDP_OPTS[@]}" -v -sU -Pn $(< "${NMAP_TARGETS}") \
-        2>&1 >> "${NMAP_LOG}" || exit $?
-fi
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_udp
 
-egrep '^Nmap scan report|/(tcp|udp).*open' "${NMAP_LOG}" >> "${NMAP_SHORT_LOG}"
-egrep -o 'DNS:[^ ,]+' "${NMAP_LOG}" | cut -d: -f2 | sort -u >> dns_names_from_ssl_certs.txt
-
-[[ -d services ]] || mkdir services || exit $?
-[[ -d ports ]] || mkdir ports || exit $?
-# rm ports/*.txt services/*.txt
-sed -n -E 's/^Nmap scan report for.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\)?$|^([0-9]+)\/(tcp|udp) +([^ ]+) +([^ ]+).*/\1,\2,\3,\4,\5/p' \
-    "${NMAP_SHORT_LOG}" | while IFS=, read ip port proto state service ; do
-        if [[ -n "${ip}" ]] ; then
-            cur_ip="${ip}"
-        else
-            log DEBUG "${proto} service ${service} is ${state} on ${cur_ip}:${port}"
-            state="${state//\//_}"
-            service="${service//\//_}"
-            service="${service//\?/}"
-            echo "${cur_ip}" >> "ports/${proto}_${state}_${port}.txt" 
-            echo "${cur_ip}:${port}" >> "services/${service}_${state}.txt" 
-        fi
-    done
-
-for f in services/*.txt ports/*.txt ; do
-    sort -u "${f}" > "${f/.txt/..txt}"
-    mv "${f/.txt/..txt}" "${f}"
-done
+process_nmap_log
 
 ### SSL
-#TODO other SSL services, inspect with openssl s_client
 prompt proceed "Proceed with the SSL scan?" 1
-if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
-    cat services/ssl_* 2>/dev/null | while IFS=: read ip port ; do
-        for host in $(get_dns_names "${ip}") ; do
-            if [[ ! -f "testssl_${host}_${port}.log" ]] ; then
-                testssl.sh "${host}:${port}" > "testssl_${host}_${port}.log"
-            fi
-            if [[ ! -f "sslscan_${host}_${port}.log" ]] ; then
-                sslscan "${host}:${port}" > "sslscan_${host}_${port}.log"
-            fi
-            if [[ ! -f "sslenumciphers_${host}_${port}.log" ]] ; then
-                nmap -p "${port}" -Pn --script sslv2,ssl-enum-ciphers "${host}" \
-                    > "sslenumciphers_${host}_${port}.log"
-            fi
-        done
-    done
-fi
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_ssl
 
 ### FTP
 prompt proceed "Proceed with the FTP phase?" 1
-if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
-    if [[ -f services/ftp_open.txt ]] ; then
-        while IFS=: read ip port ; do
-            #TODO other users passes, use a dictionary
-            for user in ftp anonymous ; do
-                lftp -p "${port}" -u "${user}","" "${ip}" \
-                    < <(echo -e "set ssl:verify-certificate false\nls") \
-                    &> "lftp_${ip}_${port}.log"
-            done
-        done < services/ftp_open.txt
-    fi
-fi
-
-### AQUATONE
-prompt proceed "Proceed with the Aquatone phase?" 1
-if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
-    # for host in $(< "${AQUATONE_TARGETS}") ; do
-    #     aquatone-discover -d "${host}" || exit $?
-    # done
-    open_ports=$(sed -n -E 's/^Discovered open port ([0-9]+)\/tcp .*/\1/p' "${NMAP_LOG}" | sort -u | tr '\n' ,)
-    open_ports="${open_ports%,}"
-    #XXX what if no open ports
-    for host in $(< "${AQUATONE_TARGETS}") ; do
-        aquatone-scan -d "${host}" -p "${open_ports}" 2>&1 >> "${AQUATONE_LOG}" || exit $?
-    done
-    for host in $(< "${AQUATONE_TARGETS}") ; do
-        aquatone-gather -d "${host}" 2>&1 >> "${AQUATONE_LOG}" || exit $?
-    done
-fi
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_ftp
 
 ### SSH
 prompt proceed "Proceed with the ssh phase?" 1
-if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
-    if [[ -f services/ssh_open.txt ]] ; then
-        while IFS=: read ip port ; do
-            log DEBUG "Getting SSH info for ${ip} on port ${port}"
-            ssh aura@"${ip}" -vvv -fnN \
-                -o StrictHostKeyChecking=no \
-                -o BatchMode=yes &> "ssh_${ip}_${port}.log"
-        done < services/ssh_open.txt
-    fi
-fi
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_ssh
 
 ### SMTP
 prompt proceed "Proceed with the smtp phase?" 1
-if [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] ; then
-    while IFS=: read -u3 ip port ; do
-        for host in $(get_dns_names "${ip}") ; do
-            #TODO check smtp_tried, add to it
-            # [[ "${port}" -eq 587 ]] && continue
-            if [[ "${host}" == mail*.* ]] ; then
-                log DEBUG "Stripping ${host%%.*} from host"
-                host="${host#*.}"
-            fi
-            [[ -f "sendEmail_${ip}_${port}.log" ]] && continue
-            prompt proceed "Send email from aurainfosec-demo@${host} (port ${port})?" 1
-            [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] || continue
-            sendEmail -s "${host}:${port}" \
-                -o timeout=20 \
-                -f 'Aura Infosec PenTest <aurainfosec-demo@'"${host}"'>' \
-                -t "${MAILTO}" -u 'Test message' -m 'Test message' \
-                    &> "sendEmail_${ip}_${port}.log"
-            echo
-        done
-    done 3< <(cat services/smtp_open.txt 2>/dev/null)
-fi
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_smtp
+
+### AQUATONE
+prompt proceed "Proceed with the Aquatone phase?" 1
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_with_aquatone
