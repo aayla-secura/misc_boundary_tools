@@ -1,6 +1,4 @@
 #!/bin/bash
-# targets should be a csv: DNS name,IP address
-# needs testssl.sh, sslscan, nmap, sendEmail
 
 MAILTO='user@example.com' # UPDATE THIS
 
@@ -48,12 +46,16 @@ ${ANSI_INFO}Misc options:${ANSI_RESET}
 
 ${ANSI_INFO}Nmap options:${ANSI_RESET}
 
-    ${ANSI_CYAN}-T  <ports>${ANSI_RESET}     Scan the given TCP port range.
-    ${ANSI_CYAN}-U  <ports>${ANSI_RESET}     Scan the given UDP port range.
-    ${ANSI_CYAN}-tT <ports>${ANSI_RESET}     Scan the <n> most common TCP ports.
-    ${ANSI_CYAN}-tU <ports>${ANSI_RESET}     Scan the <n> most common UDP ports.
+    ${ANSI_CYAN}-pT  <ports>${ANSI_RESET}    Scan the given TCP port range.
+    ${ANSI_CYAN}-pU  <ports>${ANSI_RESET}    Scan the given UDP port range.
+    ${ANSI_CYAN}-ptT <ports>${ANSI_RESET}    Scan the <n> most common TCP ports.
+    ${ANSI_CYAN}-ptU <ports>${ANSI_RESET}    Scan the <n> most common UDP ports.
 
   Default is all TCP ports and top 100 UDP ports.
+
+${ANSI_INFO}FTP options:${ANSI_RESET}
+    ${ANSI_CYAN}-fU <user file>${ANSI_RESET} File containing usernames for FTP bruteforce, one per line. Default is /dev/null (no login attempt)
+    ${ANSI_CYAN}-fP <pass file>${ANSI_RESET} File containing passwords for FTP bruteforce, one per line. Default is /dev/null (no login attempt)
 EOF
 exit 1
 }
@@ -192,14 +194,16 @@ function scan_ssl {
 }
 
 function scan_ftp {
-    if [[ -f services/ftp_open.txt ]] ; then
+    if [[ -f services/ftp_open.txt && -s "${FTP_USERS}" && -s "${FTP_PWDS}" ]] ; then
         while IFS=: read ip port ; do
-            #TODO other users passes, use a dictionary
-            for user in ftp anonymous ; do
-                lftp -p "${port}" -u "${user}","" "${ip}" \
-                    < <(echo -e "set ssl:verify-certificate false\nls") \
-                    &> "lftp_${ip}_${port}.log"
-            done
+            hydra -u -I -L "${FTP_USERS}" -P "${FTP_PWDS}" -s "${port}" "${ip}" ftp
+            #for user in "${FTP_USERS[@]}" ; do
+            #    for pass in "${FTP_PWDS[@]}" ; do
+            #        lftp -p "${port}" -u "${user}","${pass}" "${ip}" \
+            #            < <(echo -e "set ssl:verify-certificate false\nls") \
+            #            &> "lftp_${ip}_${port}.log"
+            #    done
+            #done
         done < services/ftp_open.txt
     fi
 }
@@ -226,15 +230,31 @@ function scan_smtp {
             fi
             [[ -f "sendEmail_${ip}_${port}.log" ]] && continue
             prompt proceed "Send email from aurainfosec-demo@${host} (port ${port})?" 1
-            [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] || continue
-            sendEmail -s "${host}:${port}" \
-                -o timeout=20 \
-                -f 'Aura Infosec PenTest <aurainfosec-demo@'"${host}"'>' \
-                -t "${MAILTO}" -u 'Test message' -m 'Test message' \
-                    &> "sendEmail_${ip}_${port}.log"
-            echo
+            [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && send_email "${host}" "${port}"
         done
     done 3< <(cat services/smtp_open.txt 2>/dev/null)
+}
+
+function send_email {
+    local host="$1" port="$2"
+    #XXX does sendmail support non-standard port?
+    if which -s sendmail ; then
+        sendmail \
+            -f 'Aura Infosec PenTest <aurainfosec-demo@'"${host}"'>' \
+            -t "${MAILTO}" -O ConnectionCacheTimeout=5 \
+            "${host}:${port}" \
+                &> "sendmail_${host}_${port}.log"
+        return
+    fi
+
+    if which -s sendEmail ; then
+        sendEmail \
+            -f 'Aura Infosec PenTest <aurainfosec-demo@'"${host}"'>' \
+            -t "${MAILTO}" -o timeout=5 \
+            -s "${host}:${port}" \
+                &> "sendEmail_${host}_${port}.log"
+        return
+    fi
 }
 
 function scan_with_aquatone {
@@ -258,8 +278,8 @@ NMAP_UDP_OPTS=(--top-ports 100)
 
 while [[ $# -gt 0 ]] ; do
     case $1 in
-        -T*|-U*|-tT*|-tU*)
-            opt="${1#-}"
+        -pT*|-pU*|-ptT*|-ptU*)
+            opt="${1#-p}"
             if [[ "${opt}" == t* ]] ; then
                 range_type="--top-ports"
                 opt="${opt#t}"
@@ -280,6 +300,16 @@ while [[ $# -gt 0 ]] ; do
             fi
 
             typeset -a ${arr}="(${range_type} '${ports}')"
+            ;;
+        -fU*|-fP*)
+            opt="${1#-f}"
+            [[ ${opt:0:1} == 'U' ]] && var="FTP_USERS" || var="FTP_PWDS"
+
+            typeset ${var}="${opt:1}"
+            if [[ -z "${!var}" ]] ; then
+                typeset ${var}="$2"
+                shift
+            fi
             ;;
         -D)
             WDIR="${1:2}"
