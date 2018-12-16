@@ -1,5 +1,6 @@
 #!/bin/bash
 
+shopt -s nullglob
 MAILTO='user@example.com' # UPDATE THIS
 
 # regularly updated list of valid TLDs and their own SLDs at
@@ -130,24 +131,35 @@ function get_topmost_match_domain {
 function get_dns_names {
     local ip="$1"
     log DEBUG "Getting DNS names for ${ip}" 1>&2
-    grep "${ip}" "${TARGETS}" | cut -d, -f1
+    grep "${ip}" "${TARGETS}" | cut -d, -f1 | egrep --color=never '[^ ]' # remove blank entries
 }
 
 function scan_tcp {
+    for f in "${NMAP_LOG}".* ; do
+        prompt proceed "Previous scan logs will be overwritten! Proceed?" 1
+        [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] || return
+        break
+    done
     sudo nmap "${NMAP_TCP_OPTS[@]}" -v -sC -Pn -sV -O $(< "${NMAP_TARGETS}") \
-        2>&1 >> "${NMAP_LOG}" || \
+        -oA "${NMAP_LOG}" > "${NMAP_LOG}" || \
             nmap "${NMAP_TCP_OPTS[@]}" -v -sC -Pn -sV $(< "${NMAP_TARGETS}") \
-                2>&1 >> "${NMAP_LOG}" || exit $?
+                -oA "${NMAP_LOG}" > "${NMAP_LOG}" || exit $?
 }
 
 function scan_udp {
+    for f in "${NMAP_LOG}".* ; do
+        prompt proceed "Previous scan logs will be overwritten! Proceed?" 1
+        [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] || return
+        break
+    done
     sudo nmap "${NMAP_UDP_OPTS[@]}" -v -sU -Pn $(< "${NMAP_TARGETS}") \
-        2>&1 >> "${NMAP_LOG}" || exit $?
+        -oA "${NMAP_LOG}" >> "${NMAP_LOG}" || exit $?
 }
 
 function process_nmap_log {
     egrep '^Nmap scan report|/(tcp|udp).*open' "${NMAP_LOG}" > "${NMAP_SHORT_LOG}"
     egrep -o 'DNS:[^ ,]+' "${NMAP_LOG}" | cut -d: -f2 | sort -u > dns_names_from_ssl_certs.txt
+    #XXX TARGETS is two column, comma-separated, dns_names_from_ssl_certs is only DNS names
     new_targets=$(comm -13 "${TARGETS}" dns_names_from_ssl_certs.txt)
     if [[ -n "${new_targets}" ]] ; then
         log INFO "Discovered the following new DNS names in SSL certificates:\\n${new_targets}"
