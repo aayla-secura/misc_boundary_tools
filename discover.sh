@@ -192,7 +192,7 @@ function scan_ssl {
     cat services/ssl_* 2>/dev/null | while IFS=: read ip port ; do
         for host in $(get_dns_names "${ip}") ; do
             if [[ ! -f "testssl_${host}_${port}.log" ]] ; then
-                testssl.sh "${host}:${port}" > "testssl_${host}_${port}.log"
+                docker run -t --rm mvance/testssl:latest "${host}:${port}" > "testssl_${host}_${port}.log"
             fi
             if [[ ! -f "sslscan_${host}_${port}.log" ]] ; then
                 sslscan "${host}:${port}" > "sslscan_${host}_${port}.log"
