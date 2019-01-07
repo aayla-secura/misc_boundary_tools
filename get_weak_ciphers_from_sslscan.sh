@@ -31,7 +31,7 @@ done < <(
 
 rmansi | gsed -E \
     '/Supported Server Cipher/,/^ *$/ {
-        :A /SHA |MD5|RC4|DES/ {bB} ; d ;
+        :A / DHE?-|SHA |MD5|RC4|DES|AES128/ {bB} ; d ;
         :B s/^ *[^ ]+ +(TLS|SSL)v[0-9.]+ + [0-9]+ bits +([^ ]+).*/\1 \2/ ; n;bA
     } ; d' | sort -u | while read ver openssl_cipher ; do
         n="${ver}_${openssl_cipher//-/_}"

@@ -189,7 +189,7 @@ function process_nmap_log {
 }
 
 function scan_ssl {
-    cat services/ssl_* 2>/dev/null | while IFS=: read ip port ; do
+    cat services/https* services/ssl_* 2>/dev/null | while IFS=: read ip port ; do
         for host in $(get_dns_names "${ip}") ; do
             if [[ ! -f "testssl_${host}_${port}.log" ]] ; then
                 docker run -t --rm mvance/testssl:latest "${host}:${port}" > "testssl_${host}_${port}.log"
