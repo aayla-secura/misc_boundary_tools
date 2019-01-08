@@ -134,6 +134,19 @@ function get_dns_names {
     grep "${ip}" "${TARGETS}" | cut -d, -f1 | egrep --color=never '[^ ]' # remove blank entries
 }
 
+function get_ips_from_range {
+    nmap -sL -n "$@" | sed -E -n 's/^Nmap scan report for //p'
+}
+
+function rdns {
+    get_ips_from_range $(cut -d, -f2 "${TARGETS}") | while IFS= read ip ; do
+        [[ -n "$ip" ]] || continue
+        ${MYDIR}/dnsQ.sh -r "$ip" | sed 's/$/,'"$ip"'/'
+    done | sort -u > dns_names_from_passivedns.txt
+    [[ -s dns_names_from_passivedns.txt ]] && \
+        log INFO "Reverse DNS names for IP targets saved to dns_names_from_passivedns.txt"
+}
+
 function scan_tcp {
     for f in "${NMAP_LOG}".* ; do
         prompt proceed "Previous scan logs will be overwritten! Proceed?" 1
@@ -158,6 +171,7 @@ function scan_udp {
 
 function process_nmap_log {
     egrep '^Nmap scan report|/(tcp|udp).*open' "${NMAP_LOG}" > "${NMAP_SHORT_LOG}"
+    #XXX get the IP address
     egrep -o 'DNS:[^ ,]+' "${NMAP_LOG}" | cut -d: -f2 | sort -u > dns_names_from_ssl_certs.txt
     #XXX TARGETS is two column, comma-separated, dns_names_from_ssl_certs is only DNS names
     new_targets=$(comm -13 "${TARGETS}" dns_names_from_ssl_certs.txt)
@@ -186,6 +200,12 @@ function process_nmap_log {
         sort -u "${f}" > "${f/.txt/..txt}"
         mv "${f/.txt/..txt}" "${f}"
     done
+
+    #XXX use dns_names_from_passivedns.txt
+    cat services/http_open.txt 2>/dev/null | sed 's|^|http://|' > http_urls.txt
+    cat services/https_open.txt services/ssl_https_open.txt \
+    services/ssl_http_open.txt dns_names_from_ssl_certs.txt \
+        2>/dev/null | sed 's|^|https://|' >> http_urls.txt
 }
 
 function scan_ssl {
@@ -359,6 +379,10 @@ if [[ ! -f "${TARGETS}" ]] ; then
     exit 1
 fi
 
+MYPATH=$(/usr/bin/which "${BASH_SOURCE[0]}")
+MYDIR=$(dirname "${MYPATH}")
+MYDIR=$(cd -P -- "${MYDIR}" ; pwd -P)
+
 WDIR="${WDIR:-discover_${DATE}}"
 [[ -d "${WDIR}" ]] || mkdir "${WDIR}" || exit $?
 cd "${WDIR}"
@@ -368,6 +392,9 @@ AQUATONE_LOG="aquatone.log"
 NMAP_SHORT_LOG="nmap_default_scripts_short.log"
 AQUATONE_TARGETS="aquatone_targets.txt"
 NMAP_TARGETS="nmap_targets.txt"
+
+prompt proceed "Proceed with the reverse DNS queries?" 1
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && rdns
 
 #TODO option to append to those
 if [[ ! -f "${AQUATONE_TARGETS}" ]] ; then
