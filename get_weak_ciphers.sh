@@ -1,31 +1,23 @@
 #!/bin/bash
-# Reads from stdin, expects output from nmap's ssl-enum-ciphers or sslv2
+# Reads from stdin, expects output from nmap's ssl-enum-ciphers or sslv2 scripts
 
 function usage {
     cat <<EOF
 Usage:
-    ${BASH_SOURCE[0]} -s <level>
+    ${BASH_SOURCE[0]} [-g]
 
 Options:
-    -s <level>      If <level> is > 1 also flag SHA1 as bad
-                    If <level> is > 2 also flag 128-bit ciphers as bad
+    -g     For government.
 EOF
 exit 1
 }
 
-RE='MD5|RC4|DES'
+RE='(TLS|SSL)_RSA|_(NULL|RC4|3?DES|MD5|SHA($|[^2-5]))'
+NEG_RE=''
 while [[ $# -gt 0 ]] ; do
     case $1 in
-        -s*)
-            if [[ $1 == '-s' ]] ; then
-                LVL="$2"
-                shift
-            else
-                LVL="${1#-s}"
-            fi
-            [[ ${LVL} =~ ^[0-9]+$ ]] || usage
-            [[ ${LVL} -ge 2 ]] && RE+='_DHE?_|_128'
-            [[ ${LVL} -ge 1 ]] && RE+='|SHA($|[^23])'
+        -g)
+            NEG_RE='^TLS_ECDHE?_ECDSA_'
             ;;
         -h)
             usage
@@ -42,9 +34,11 @@ while [[ $# -gt 0 ]] ; do
     shift
 done
 
-gsed -E \
-    '/^\|_? +((SSL2?|TLS)_[^ ]+).*/ {
-        :A /'"${RE}"'/ {bB} ; d ;
-        :B s/^\|_? +((SSL2?|TLS)_[^ ]+).*/\1/ 
-           s/^SSL2/SSL/ ; n;bA
-    } ; d' | sort -u
+awk -v re="$RE" -v neg_re="$NEG_RE" \
+    '/^\|_? +((SSL2?|TLS)_)/ {
+      cipher=gensub(/^\|_? +((?:SSL2?|TLS)_[^ ]+).*/, "\\1", 1) 
+      cipher=gensub(/^SSL2/, "SSL", 1, cipher)
+      if (cipher ~ re || cipher !~ neg_re) {
+        print cipher
+      }
+    }' | sort -u
