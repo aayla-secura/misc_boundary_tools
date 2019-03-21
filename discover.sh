@@ -79,7 +79,6 @@ function to_posnum {
   echo -n "${arg}"
 }
 
-
 function prompt {
   local var="$1" msg="$2" yesno=$(to_bool "$3") level="PROMPT"
   print "${level}" "\\n     ${msg} "
@@ -131,7 +130,8 @@ function get_topmost_match_domain {
 function get_dns_names {
   local ip="$1"
   log DEBUG "Getting DNS names for ${ip}" 1>&2
-  grep "${ip}" "${TARGETS}" | cut -d, -f1 | egrep --color=never '[^ ]' # remove blank entries
+  grep -h "${ip}" "${ALL_TARGETS}" | \
+    cut -d, -f1 | egrep --color=never '[^ ]' # remove blank entries
 }
 
 function resolve {
@@ -142,7 +142,7 @@ function resolve {
 
 function reverse_ip {
   local ip="$1"
-  gawk '{
+  awk '{
     split($0,arr,".")
     printf arr[4] "." arr[3] "." arr[2] "." arr[1]
   }' <<<"${ip}"
@@ -150,38 +150,38 @@ function reverse_ip {
 
 function live_dns {
   local crap host ip iporig
-  nmap -sL -R $(tr , \\n <"${TARGETS}") | \
-    awk '/^Nmap scan report for/{
-      match($0,/^Nmap scan report for +([^ ]+)( +\(([^\)]+)\))?$/,arr)
-      host=arr[1]
-      ip=arr[3]
-      if (!ip){ ip=host; host="" }
-      if (ip) { printf host "," ip "\n" }
-    }' | \
-      while IFS=, read host ip ; do
-        # if the DNS name is some generic one (contains the ip address in some
-        # form), then don't bother
-        crap=0
-        iporig=${ip}
-        revip=$(reverse_ip ${ip})
-        [[ ${host/${ip}/} != ${host} ]] || \
-          [[ ${host/${revip}/} != ${host} ]] && crap=1
-        ip=${ip//./-}
-        revip=${revip//./-}
-        [[ ${host/${ip}/} != ${host} ]] || \
-          [[ ${host/${revip}/} != ${host} ]] && crap=1
-        ip=${ip//-/_}
-        revip=${revip//-/_}
-        [[ ${host/${ip}/} != ${host} ]] || \
-          [[ ${host/${revip}/} != ${host} ]] && crap=1
-        log DEBUG "DNS for ${host},${iporig} is crap? ${crap}" 1>&2
-        [[ ${crap} -eq 1 ]] && echo ",${iporig}" || echo "${host},${iporig}"
-      done > "${RESOLVED_TARGETS}"
+  while IFS=, read -u3 host ip ; do
+    # if the DNS name is some generic one (contains the ip address in some
+    # form), then don't bother
+    crap=0
+    iporig=${ip}
+    revip=$(reverse_ip ${ip})
+    [[ ${host/${ip}/} != ${host} ]] || \
+      [[ ${host/${revip}/} != ${host} ]] && crap=1
+    ip=${ip//./-}
+    revip=${revip//./-}
+    [[ ${host/${ip}/} != ${host} ]] || \
+      [[ ${host/${revip}/} != ${host} ]] && crap=1
+    ip=${ip//-/_}
+    revip=${revip//-/_}
+    [[ ${host/${ip}/} != ${host} ]] || \
+      [[ ${host/${revip}/} != ${host} ]] && crap=1
+    log DEBUG "DNS for ${host},${iporig} is crap? ${crap}" 1>&2
+    [[ ${crap} -eq 1 ]] && echo ",${iporig}" || echo "${host},${iporig}"
+  done > "${RESOLVED_TARGETS}" \
+    3< <(nmap -sL -R $(tr , \\n <"${TARGETS}") | \
+        awk '/^Nmap scan report for/{
+          match($0,/^Nmap scan report for +([^ ]+)( +\(([^\)]+)\))?$/,arr)
+          host=arr[1]
+          ip=arr[3]
+          if (!ip){ ip=host; host="" }
+          if (ip) { printf host "," ip "\n" }
+        }')
 }
 
 function pass_dns {
   local host ip
-  while IFS=, read host ip ; do
+  while IFS=, read -u3 host ip ; do
     if [[ -n "${host}" ]] ; then
       # passive forward DNS
       ${MYDIR}/dnsQ.sh "${host}" | sed 's/^/'"${host}"',/'
@@ -190,80 +190,84 @@ function pass_dns {
       # passive reverse DNS
       ${MYDIR}/dnsQ.sh -r "${ip}" | sed 's/$/,'"${ip}"'/'
     fi
-  done < "${RESOLVED_TARGETS}" | sort -u > "${PASSDNS_TARGETS}"
+  done 3< "${RESOLVED_TARGETS}" | sort -u > "${PASSDNS_TARGETS}"
   [[ -s "${PASSDNS_TARGETS}" ]] && \
     log INFO "Reverse DNS names for IP targets saved to '${PASSDNS_TARGETS}'"
 }
 
 function scan_tcp {
   local f
-  for f in "${NMAP_LOG}".* ; do
+  for f in "${NMAP_TCP_LOG}".* ; do
     prompt proceed "Previous scan logs will be overwritten! Proceed?" 1
     [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] || return
     break
   done
   sudo nmap "${NMAP_TCP_OPTS[@]}" -v -sC -Pn -sV -O $(< "${NMAP_TARGETS}") \
-    -oA "${NMAP_LOG}" > "${NMAP_LOG}" || \
+    -oA "${NMAP_TCP_LOG}" > "${NMAP_TCP_LOG}" || \
       nmap "${NMAP_TCP_OPTS[@]}" -v -sC -Pn -sV $(< "${NMAP_TARGETS}") \
-        -oA "${NMAP_LOG}" > "${NMAP_LOG}" || exit $?
+        -oA "${NMAP_TCP_LOG}" > "${NMAP_TCP_LOG}" || exit $?
 }
 
 function scan_udp {
   local f
-  for f in "${NMAP_LOG}".* ; do
+  for f in "${NMAP_UDP_LOG}".* ; do
     prompt proceed "Previous scan logs will be overwritten! Proceed?" 1
     [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] || return
     break
   done
   sudo nmap "${NMAP_UDP_OPTS[@]}" -v -sU -Pn $(< "${NMAP_TARGETS}") \
-    -oA "${NMAP_LOG}" >> "${NMAP_LOG}" || exit $?
+    -oA "${NMAP_UDP_LOG}" >> "${NMAP_UDP_LOG}" || exit $?
 }
 
 function process_nmap_log {
   local f ip port proto state service
+  cat "${NMAP_TCP_LOG}" "${NMAP_UDP_LOG}" > "${NMAP_LOG}"
   egrep '^Nmap scan report|/(tcp|udp).*open' "${NMAP_LOG}" > "${NMAP_SHORT_LOG}"
   #XXX get the IP address
   egrep -o 'DNS:[^ ,]+' "${NMAP_LOG}" | cut -d: -f2 | sort -u > dns_names_from_ssl_certs.txt
   #XXX TARGETS is two column, comma-separated, dns_names_from_ssl_certs is only DNS names
-  new_targets=$(comm -13 "${TARGETS}" dns_names_from_ssl_certs.txt)
+  new_targets=$(comm -13 "${ALL_TARGETS}" dns_names_from_ssl_certs.txt)
   if [[ -n "${new_targets}" ]] ; then
     log INFO "Discovered the following new DNS names in SSL certificates:\\n${new_targets}"
   fi
 
   [[ -d services ]] || mkdir services || exit $?
   [[ -d ports ]] || mkdir ports || exit $?
-  rm ports/*.txt services/*.txt
-  sed -n -E 's/^Nmap scan report for.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\)?$|^([0-9]+)\/(tcp|udp) +([^ ]+) +([^ ]+).*/\1,\2,\3,\4,\5/p' \
-    "${NMAP_SHORT_LOG}" | while IFS=, read ip port proto state service ; do
-      if [[ -n "${ip}" ]] ; then
-        cur_ip="${ip}"
-      else
-        log DEBUG "${proto} service ${service} is ${state} on ${cur_ip}:${port}"
-        state="${state//\//_}"
-        service="${service//\//_}"
-        service="${service//\?/}"
-        echo "${cur_ip}" >> "ports/${proto}_${state}_${port}.txt" 
-        echo "${cur_ip}:${port}" >> "services/${service}_${state}.txt" 
-      fi
-    done
+  rm -f ports/*.txt services/*.txt
+  while IFS=, read -u3 ip port proto state service ; do
+    if [[ -n "${ip}" ]] ; then
+      cur_ip="${ip}"
+    else
+      log DEBUG "${proto} service ${service} is ${state} on ${cur_ip}:${port}"
+      state="${state//\//_}"
+      service="${service//\//_}"
+      service="${service//\?/}"
+      echo "${cur_ip}" >> "ports/${proto}_${state}_${port}.txt" 
+      echo "${cur_ip}:${port}" >> "services/${service}_${state}.txt" 
+    fi
+  done 3< <(
+    sed -n -E 's/^Nmap scan report for.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\)?$|^([0-9]+)\/(tcp|udp) +([^ ]+) +([^ ]+).*/\1,\2,\3,\4,\5/p' "${NMAP_SHORT_LOG}"
+  )
 
   for f in services/*.txt ports/*.txt ; do
     sort -u "${f}" > "${f/.txt/..txt}"
     mv "${f/.txt/..txt}" "${f}"
   done
 
-  cat services/http_open.txt 2>/dev/null | sed 's|^|http://|' > http_urls.txt
+  cat services/http_open.txt 2>/dev/null | sed 's|\*\.||;s|^|http://|' > http_urls.txt
   cat services/https_open.txt services/ssl_https_open.txt \
   services/ssl_http_open.txt dns_names_from_ssl_certs.txt \
-    2>/dev/null | sed 's|^|https://|' >> http_urls.txt
+    2>/dev/null | sed 's|\*\.||;s|^|https://|' >> http_urls.txt
 }
 
 function scan_ssl {
   local host ip port
-  cat services/https* services/ssl_* 2>/dev/null | while IFS=: read ip port ; do
+  while IFS=: read -u3 ip port ; do
     for host in $(get_dns_names "${ip}") ; do
+      log DEBUG "Scanning host ${host}:${port}"
       if [[ ! -f "testssl_${host}_${port}.log" ]] ; then
-        docker run -t --rm mvance/testssl:latest "${host}:${port}" > "testssl_${host}_${port}.log"
+        docker run -t --rm drwetter/testssl.sh:latest "${host}:${port}" \
+          > "testssl_${host}_${port}.log"
       fi
       if [[ ! -f "sslscan_${host}_${port}.log" ]] ; then
         sslscan "${host}:${port}" > "sslscan_${host}_${port}.log"
@@ -273,13 +277,13 @@ function scan_ssl {
           > "sslenumciphers_${host}_${port}.log"
       fi
     done
-  done
+  done 3< <(cat services/https* services/ssl_* < /dev/null 2>/dev/null)
 }
 
 function scan_ftp {
   local ip port
   if [[ -f services/ftp_open.txt && -s "${FTP_USERS}" && -s "${FTP_PWDS}" ]] ; then
-    while IFS=: read ip port ; do
+    while IFS=: read -u3 ip port ; do
       hydra -u -I -L "${FTP_USERS}" -P "${FTP_PWDS}" -s "${port}" "${ip}" ftp
       #for user in "${FTP_USERS[@]}" ; do
       #  for pass in "${FTP_PWDS[@]}" ; do
@@ -288,19 +292,19 @@ function scan_ftp {
       #      &> "lftp_${ip}_${port}.log"
       #  done
       #done
-    done < services/ftp_open.txt
+    done 3< services/ftp_open.txt
   fi
 }
 
 function scan_ssh {
   local ip port
   if [[ -f services/ssh_open.txt ]] ; then
-    while IFS=: read ip port ; do
+    while IFS=: read -u3 ip port ; do
       log DEBUG "Getting SSH info for ${ip} on port ${port}"
       ssh aura@"${ip}" -vvv -fnN \
         -o StrictHostKeyChecking=no \
         -o BatchMode=yes &> "ssh_${ip}_${port}.log"
-    done < services/ssh_open.txt
+    done 3< services/ssh_open.txt
   fi
 }
 
@@ -443,23 +447,39 @@ WDIR="${WDIR:-discover_${DATE}}"
 cd "${WDIR}"
 
 NMAP_LOG="nmap_default_scripts.log"
+NMAP_TCP_LOG="nmap_default_scripts_tcp.log"
+NMAP_UDP_LOG="nmap_default_scripts_udp.log"
 AQUATONE_LOG="aquatone.log"
 NMAP_SHORT_LOG="nmap_default_scripts_short.log"
 AQUATONE_TARGETS="aquatone_targets.txt"
 NMAP_TARGETS="nmap_targets.txt"
 RESOLVED_TARGETS="targets_from_dns.txt"
 PASSDNS_TARGETS="targets_from_passive_dns.txt"
+ALL_TARGETS="targets_all.txt"
 
 # Live DNS resolution
-prompt proceed "Proceed with the live DNS queries?" 1
-[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && live_dns || cp "${TARGETS}" "${RESOLVED_TARGETS}"
+if [[ ! -f "${RESOLVED_TARGETS}" ]] ; then
+  prompt proceed "Proceed with the live DNS queries?" 1
+  [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && live_dns || cp "${TARGETS}" "${RESOLVED_TARGETS}"
+fi
 
-prompt proceed "Proceed with the passive DNS queries?" 1
-[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && pass_dns
+if [[ ! -f "${PASSDNS_TARGETS}" ]] ; then
+  prompt proceed "Proceed with the passive DNS queries?" 1
+  [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && pass_dns || touch "${PASSDNS_TARGETS}"
+fi
+
+prompt regex "Filtering all found targets.\nEnter regex which must match (or blank for any)" 0
+prompt regex_negative "Enter regex which must not match (or blank for none)" 0
+prompt keep_nohostname "Keep entries with IP address only?" 1
+awk -F, -v re="${regex}" -v neg_re="${regex_negative}" -v nohost="${keep_nohostname/n/}" \
+  '( (($0 ~ re || !re) && ($0 !~ neg_re || !neg_re) && $2 && ((!h[$1]++ || !$1) && !i[$2]++)) || (nohost && $0 ~ /^,/ && !i[$2]++) ) {
+    print $0
+  }' "${TARGETS}" "${RESOLVED_TARGETS}" "${PASSDNS_TARGETS}" \
+    > "${ALL_TARGETS}"
 
 #TODO option to append to those
 if [[ ! -f "${AQUATONE_TARGETS}" ]] ; then
-  cut -d, -f1 "${TARGETS}" | get_one_above_tlds > "${AQUATONE_TARGETS}"
+  cut -d, -f1 "${ALL_TARGETS}" | get_one_above_tlds > "${AQUATONE_TARGETS}"
   log INFO "Targets for Aquatone saved to ${AQUATONE_TARGETS}."
   prompt ignored "Edit as needed, then press Enter to proceed"
 fi
@@ -468,8 +488,8 @@ fi
 #TODO option to add /<n> for every IP in a particular geo area
 #TODO option to append to those
 if [[ ! -f "${NMAP_TARGETS}" ]] ; then
-  cat "${PASSDNS_TARGETS}" "${RESOLVED_TARGETS}" | sed 's/^www\.//' | sort -u \
-    | tr , \\n | gawk '!x[$0]++ && $0' > "${NMAP_TARGETS}"
+  cat "${PASSDNS_TARGETS}" "${RESOLVED_TARGETS}" | sed 's/^www\.//' | sort -u | \
+    tr , \\n | awk '!x[$0]++ && $0' > "${NMAP_TARGETS}"
   log INFO "Targets for Nmap saved to ${NMAP_TARGETS}."
   prompt ignored "Edit as needed, then press Enter to proceed"
 fi
