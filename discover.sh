@@ -1,4 +1,8 @@
 #!/bin/bash
+#TODO
+# - split targets into n bands for parallel scanning
+# - geoiplookup
+# - batch mode
 
 shopt -s nullglob
 MAILTO='user@example.com' # UPDATE THIS
@@ -44,6 +48,11 @@ ${ANSI_INFO}Arguments:${ANSI_RESET}
 ${ANSI_INFO}Misc options:${ANSI_RESET}
   ${ANSI_CYAN}-D <directory>${ANSI_RESET}  Directory containing files from previous run
   ${ANSI_CYAN}-d${ANSI_RESET}        Enable debugging output
+
+${ANSI_INFO}Target filter options:${ANSI_RESET}
+  ${ANSI_CYAN}-tf <regex>${ANSI_RESET}        Targets which do not match this regex will be removed (default is blank for none)
+  ${ANSI_CYAN}-tF <regex>${ANSI_RESET}        Targets which match this regex will be removed (default is blank for none)
+  ${ANSI_CYAN}-ti${ANSI_RESET}        Keep targets for which reverse DNS failed (i.e. only IP address)
 
 ${ANSI_INFO}Nmap options:${ANSI_RESET}
 
@@ -184,7 +193,8 @@ function pass_dns {
   while IFS=, read -u3 host ip ; do
     if [[ -n "${host}" ]] ; then
       # passive forward DNS
-      ${MYDIR}/dnsQ.sh "${host}" | sed 's/^/'"${host}"',/'
+      ${MYDIR}/dnsQ.sh "${host}" | \
+        sed -En '/^([0-9]+\.){3}[0-9]+$/{s/^/'"${host}"',/p}'
     fi
     if [[ -n "${ip}" ]] ; then
       # passive reverse DNS
@@ -254,17 +264,24 @@ function process_nmap_log {
     mv "${f/.txt/..txt}" "${f}"
   done
 
-  cat services/http_open.txt 2>/dev/null | sed 's|\*\.||;s|^|http://|' > http_urls.txt
-  cat services/https_open.txt services/ssl_https_open.txt \
-  services/ssl_http_open.txt dns_names_from_ssl_certs.txt \
-    2>/dev/null | sed 's|\*\.||;s|^|https://|' >> http_urls.txt
+  #TODO: remove ports 80 and 443 and print only the http:// url if both http
+  # and https are present for same host (default ports)
+  { sed 's|^|http://|' services/http_open.txt 2>/dev/null
+    sed 's|^|https://|' services/https_open.txt services/ssl_http*_open.txt 2>/dev/null ; } | \
+      while IFS=: read proto ip port ; do
+        ip=${ip//\//}
+        echo "${proto}://${ip}:${port}"
+        for host in $(get_dns_names "${ip}") ; do
+          echo "${proto}://${host}:${port}"
+        done
+      done | sort -u > http_urls.txt
 }
 
 function scan_ssl {
   local host ip port
   while IFS=: read -u3 ip port ; do
     for host in $(get_dns_names "${ip}") ; do
-      log DEBUG "Scanning host ${host}:${port}"
+      log INFO "SSL scanning host ${host}:${port}"
       if [[ ! -f "testssl_${host}_${port}.log" ]] ; then
         docker run -t --rm drwetter/testssl.sh:latest "${host}:${port}" \
           > "testssl_${host}_${port}.log"
@@ -284,6 +301,7 @@ function scan_ftp {
   local ip port
   if [[ -f services/ftp_open.txt && -s "${FTP_USERS}" && -s "${FTP_PWDS}" ]] ; then
     while IFS=: read -u3 ip port ; do
+      log INFO "FTP brute forcing of ${ip}:${port}"
       hydra -u -I -L "${FTP_USERS}" -P "${FTP_PWDS}" -s "${port}" "${ip}" ftp
       #for user in "${FTP_USERS[@]}" ; do
       #  for pass in "${FTP_PWDS[@]}" ; do
@@ -300,7 +318,7 @@ function scan_ssh {
   local ip port
   if [[ -f services/ssh_open.txt ]] ; then
     while IFS=: read -u3 ip port ; do
-      log DEBUG "Getting SSH info for ${ip} on port ${port}"
+      log INFO "Getting SSH info for ${ip} on port ${port}"
       ssh aura@"${ip}" -vvv -fnN \
         -o StrictHostKeyChecking=no \
         -o BatchMode=yes &> "ssh_${ip}_${port}.log"
@@ -318,6 +336,7 @@ function scan_smtp {
         log DEBUG "Stripping ${host%%.*} from host"
         host="${host#*.}"
       fi
+      log INFO "Trying to send mail out of ${host}"
       [[ -f "sendEmail_${ip}_${port}.log" ]] && continue
       prompt proceed "Send email from aurainfosec-demo@${host} (port ${port})?" 1
       [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && send_email "${host}" "${port}"
@@ -345,6 +364,7 @@ function send_email {
         &> "sendEmail_${host}_${port}.log"
     return
   fi
+  log WARNING "No suitable sendmail program found"
 }
 
 function scan_with_aquatone {
@@ -369,6 +389,20 @@ NMAP_UDP_OPTS=(--top-ports 100)
 
 while [[ $# -gt 0 ]] ; do
   case $1 in
+    -ti)
+      FILTER_KEEP_NOHOSTNAME="y"
+      ;;
+    -tf*|-tF*)
+      #TODO function for processing of such options
+      opt="${1#-t}"
+      [[ ${opt:0:1} == 'f' ]] && var="FILTER_REGEX" || var="FILTER_REGEX_NEGATIVE"
+
+      typeset ${var}="${opt:1}"
+      if [[ -z "${!var}" ]] ; then
+        typeset ${var}="$2"
+        shift
+      fi
+      ;;
     -pT*|-pU*|-ptT*|-ptU*)
       opt="${1#-p}"
       if [[ "${opt}" == t* ]] ; then
@@ -468,10 +502,16 @@ if [[ ! -f "${PASSDNS_TARGETS}" ]] ; then
   [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && pass_dns || touch "${PASSDNS_TARGETS}"
 fi
 
-prompt regex "Filtering all found targets.\nEnter regex which must match (or blank for any)" 0
-prompt regex_negative "Enter regex which must not match (or blank for none)" 0
-prompt keep_nohostname "Keep entries with IP address only?" 1
-awk -F, -v re="${regex}" -v neg_re="${regex_negative}" -v nohost="${keep_nohostname/n/}" \
+if [[ "${FILTER_REGEX-x}" == "x" ]] ; then
+  prompt FILTER_REGEX "Filtering all found targets.\nEnter regex which must match (or blank for any)" 0
+fi
+if [[ "${FILTER_REGEX_NEGATIVE-x}" == "x" ]] ; then
+  prompt FILTER_REGEX_NEGATIVE "Enter regex which must not match (or blank for none)" 0
+fi
+if [[ "${FILTER_KEEP_NOHOSTNAME-x}" == "x" ]] ; then
+  prompt FILTER_KEEP_NOHOSTNAME "Keep entries with IP address only?" 1
+fi
+awk -F, -v re="${FILTER_REGEX}" -v neg_re="${FILTER_REGEX_NEGATIVE}" -v nohost="${FILTER_KEEP_NOHOSTNAME/n/}" \
   '( (($0 ~ re || !re) && ($0 !~ neg_re || !neg_re) && $2 && ((!h[$1]++ || !$1) && !i[$2]++)) || (nohost && $0 ~ /^,/ && !i[$2]++) ) {
     print $0
   }' "${TARGETS}" "${RESOLVED_TARGETS}" "${PASSDNS_TARGETS}" \
