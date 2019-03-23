@@ -17,7 +17,7 @@ NEG_RE=''
 while [[ $# -gt 0 ]] ; do
     case $1 in
         -g)
-            NEG_RE='^TLS_ECDHE?_ECDSA_'
+            NEG_RE='^TLS_ECDHE_ECDSA_WITH_AES_256_[A-Z0-9_]+_SHA[2-5]'
             ;;
         -h)
             usage
