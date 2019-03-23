@@ -43,23 +43,26 @@ ${ANSI_INFO}Usage:${ANSI_RESET}
   ${ANSI_WHITE}${BASH_SOURCE[0]} ${ANSI_CYAN}[<options>] ${ANSI_GREEN}<targets_file>
 
 ${ANSI_INFO}Arguments:${ANSI_RESET}
-   ${ANSI_GREEN}<targets_file>${ANSI_RESET}  A comma-separated file containing one DNS name,IP address per line
+   ${ANSI_GREEN}<targets_file>${ANSI_RESET} A comma-separated file containing one DNS name,IP address per line
 
 ${ANSI_INFO}Misc options:${ANSI_RESET}
   ${ANSI_CYAN}-D <directory>${ANSI_RESET}  Directory containing files from previous run
-  ${ANSI_CYAN}-d${ANSI_RESET}        Enable debugging output
+  ${ANSI_CYAN}-d${ANSI_RESET}              Enable debugging output
+  ${ANSI_CYAN}-b${ANSI_RESET}              Batch mode (never prompt, use defaults and other command line options)
+  ${ANSI_CYAN}-s <list>${ANSI_RESET}       Comma-separated list of stages to run or "ALL" (if option is given, will not prompt)
+                  Valid stages are "live DNS,passive DNS,TCP,UDP,SSL,FTP,SSH,SMTP,Aquatone"
 
 ${ANSI_INFO}Target filter options:${ANSI_RESET}
-  ${ANSI_CYAN}-tf <regex>${ANSI_RESET}        Targets which do not match this regex will be removed (default is blank for none)
-  ${ANSI_CYAN}-tF <regex>${ANSI_RESET}        Targets which match this regex will be removed (default is blank for none)
-  ${ANSI_CYAN}-ti${ANSI_RESET}        Keep targets for which reverse DNS failed (i.e. only IP address)
+  ${ANSI_CYAN}-tf <regex>${ANSI_RESET}     Targets which do not match this regex will be removed (default is blank for none)
+  ${ANSI_CYAN}-tF <regex>${ANSI_RESET}     Targets which match this regex will be removed (default is blank for none)
+  ${ANSI_CYAN}-ti${ANSI_RESET}             Keep targets for which reverse DNS failed (i.e. only IP address)
 
 ${ANSI_INFO}Nmap options:${ANSI_RESET}
 
-  ${ANSI_CYAN}-pT  <ports>${ANSI_RESET}  Scan the given TCP port range.
-  ${ANSI_CYAN}-pU  <ports>${ANSI_RESET}  Scan the given UDP port range.
-  ${ANSI_CYAN}-ptT <ports>${ANSI_RESET}  Scan the <n> most common TCP ports.
-  ${ANSI_CYAN}-ptU <ports>${ANSI_RESET}  Scan the <n> most common UDP ports.
+  ${ANSI_CYAN}-pT  <ports>${ANSI_RESET}    Scan the given TCP port range.
+  ${ANSI_CYAN}-pU  <ports>${ANSI_RESET}    Scan the given UDP port range.
+  ${ANSI_CYAN}-ptT <ports>${ANSI_RESET}    Scan the <n> most common TCP ports.
+  ${ANSI_CYAN}-ptU <ports>${ANSI_RESET}    Scan the <n> most common UDP ports.
 
   Default is all TCP ports and top 100 UDP ports.
 
@@ -70,8 +73,14 @@ EOF
 exit 1
 }
 
+function do_stage {
+  local stage="${1}"
+  [[ "${STAGES}" == "ALL" ]] && return 0
+  [[ "${STAGES/${stage},/}" == "${STAGES}" ]] && return 1 || return 0
+}
+
 function to_bool {
-  local arg="$1"
+  local arg="${1}"
   if [[ -n "${arg}" && ! "${arg}" =~ ^[01]$ ]] ; then
     log ERROR "Expected 0 or 1, got '${arg}'" >&2
     exit 1
@@ -80,7 +89,7 @@ function to_bool {
 }
 
 function to_posnum {
-  local arg="$1"
+  local arg="${1}"
   if [[ -n "${arg}" && ! "${arg}" =~ ^[0-9]+$ ]] ; then
     log ERROR "Expected a positive number, got '${arg}'" >&2
     exit 1
@@ -89,7 +98,15 @@ function to_posnum {
 }
 
 function prompt {
-  local var="$1" msg="$2" yesno=$(to_bool "$3") level="PROMPT"
+  local var="${1}" msg="${2}" yesno=$(to_bool "${3}") default="${4}" level="PROMPT"
+  if [[ "${BATCH}" -eq 1 ]] ; then
+    if [[ "${yesno}" -eq 0 ]] ; then
+      read -n0 foo <<<"${default}"
+    else
+      read -n1 "${var}" <<<"${default:-y}"
+    fi
+    return
+  fi
   print "${level}" "\\n     ${msg} "
   if [[ "${yesno}" -eq 0 ]] ; then
     read "${var}"
@@ -106,12 +123,12 @@ function prompt {
 }
 
 function log {
-  local level="$1" msg="$2" spaces="     "
+  local level="${1}" msg="${2}" spaces="     "
   print "${level}" "${level}: ${spaces:0:$((7 - ${#level}))}${msg}\n"
 }
 
 function print {
-  local level="$1" msg="$2" color="ANSI_${level}"
+  local level="${1}" msg="${2}" color="ANSI_${level}"
   [[ "${!level}" -le "${VERBOSITY}" ]] || return
   echo -ne "${!color}${msg}${ANSI_RESET}"
 }
@@ -127,7 +144,7 @@ function get_one_above_tlds {
 
 function get_topmost_match_domain {
   # read from stdin
-  local re match="$1" exact=$(to_bool "$2")
+  local re match="${1}" exact=$(to_bool "${2}")
   if [[ "${exact}" -eq 0 ]] ; then
     re='[^\.]*'"${match}"'[^\.]*'
   else
@@ -137,20 +154,20 @@ function get_topmost_match_domain {
 }
 
 function get_dns_names {
-  local ip="$1"
+  local ip="${1}"
   log DEBUG "Getting DNS names for ${ip}" 1>&2
   grep -h "${ip}" "${ALL_TARGETS}" | \
     cut -d, -f1 | egrep --color=never '[^ ]' # remove blank entries
 }
 
 function resolve {
-  local host="$1"
+  local host="${1}"
   log DEBUG "Getting IP address for ${host}" 1>&2
   dig +short "${host}" | sed -En '/^([0-9]+\.){3}[0-9]+$/p'
 }
 
 function reverse_ip {
-  local ip="$1"
+  local ip="${1}"
   awk '{
     split($0,arr,".")
     printf arr[4] "." arr[3] "." arr[2] "." arr[1]
@@ -208,7 +225,7 @@ function pass_dns {
 function scan_tcp {
   local f
   for f in "${NMAP_TCP_LOG}".* ; do
-    prompt proceed "Previous scan logs will be overwritten! Proceed?" 1
+    prompt proceed "Previous scan logs will be overwritten! Proceed?" 1 "n"
     [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] || return
     break
   done
@@ -221,7 +238,7 @@ function scan_tcp {
 function scan_udp {
   local f
   for f in "${NMAP_UDP_LOG}".* ; do
-    prompt proceed "Previous scan logs will be overwritten! Proceed?" 1
+    prompt proceed "Previous scan logs will be overwritten! Proceed?" 1 "n"
     [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] || return
     break
   done
@@ -345,7 +362,7 @@ function scan_smtp {
 }
 
 function send_email {
-  local host="$1" port="$2"
+  local host="${1}" port="${2}"
   #XXX does sendmail support non-standard port?
   if which -s sendmail ; then
     sendmail \
@@ -386,9 +403,10 @@ function scan_with_aquatone {
 # DEFAULTS
 NMAP_TCP_OPTS=(-p 1-65535)
 NMAP_UDP_OPTS=(--top-ports 100)
+BATCH="0"
 
 while [[ $# -gt 0 ]] ; do
-  case $1 in
+  case ${1} in
     -ti)
       FILTER_KEEP_NOHOSTNAME="y"
       ;;
@@ -399,7 +417,7 @@ while [[ $# -gt 0 ]] ; do
 
       typeset ${var}="${opt:1}"
       if [[ -z "${!var}" ]] ; then
-        typeset ${var}="$2"
+        typeset ${var}="${2}"
         shift
       fi
       ;;
@@ -416,7 +434,7 @@ while [[ $# -gt 0 ]] ; do
 
       ports="${opt:1}"
       if [[ -z "${ports}" ]] ; then
-        ports="$2"
+        ports="${2}"
         shift
       fi
       if [[ ! "${ports}" =~ ^[0-9,\ -]+$ ]] ; then
@@ -432,34 +450,46 @@ while [[ $# -gt 0 ]] ; do
 
       typeset ${var}="${opt:1}"
       if [[ -z "${!var}" ]] ; then
-        typeset ${var}="$2"
+        typeset ${var}="${2}"
         shift
       fi
       ;;
     -D)
       WDIR="${1:2}"
       if [[ -z "${WDIR}" ]] ; then
-        WDIR="$2"
+        WDIR="${2}"
         shift
       fi
       ;;
     -d)
       VERBOSITY="${DEBUG}"
       ;;
+    -b)
+      [[ "${STAGES-x}" == "x" ]] && STAGES="ALL"
+      BATCH="1"
+      ;;
+    -s*)
+      opt="${1#-s}"
+      STAGES="${opt},"
+      if [[ -z "${STAGES/,/}" ]] ; then
+        STAGES="${2},"
+        shift
+      fi
+      ;;
     -h)
       usage
       ;;
     -*)
-      log ERROR "Unknown option $1" >&2
+      log ERROR "Unknown option ${1}" >&2
       usage
       ;;
     *)
 
       if [[ -n "${TARGETS}" ]] ; then
-        log ERROR "Extra argument $1" >&2
+        log ERROR "Extra argument ${1}" >&2
         usage
       fi
-      TARGETS="$1"
+      TARGETS="${1}"
       ;;
   esac
   shift
@@ -492,21 +522,21 @@ PASSDNS_TARGETS="targets_from_passive_dns.txt"
 ALL_TARGETS="targets_all.txt"
 
 # Live DNS resolution
-if [[ ! -f "${RESOLVED_TARGETS}" ]] ; then
+if [[ ! -f "${RESOLVED_TARGETS}" ]] && do_stage "live DNS" ; then
   prompt proceed "Proceed with the live DNS queries?" 1
   [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && live_dns || cp "${TARGETS}" "${RESOLVED_TARGETS}"
 fi
 
-if [[ ! -f "${PASSDNS_TARGETS}" ]] ; then
+if [[ ! -f "${PASSDNS_TARGETS}" ]] && do_stage "passive DNS" ; then
   prompt proceed "Proceed with the passive DNS queries?" 1
   [[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && pass_dns || touch "${PASSDNS_TARGETS}"
 fi
 
 if [[ "${FILTER_REGEX-x}" == "x" ]] ; then
-  prompt FILTER_REGEX "Filtering all found targets.\nEnter regex which must match (or blank for any)" 0
+  prompt FILTER_REGEX "Filtering all found targets.\nEnter regex which must match (or blank for any)"
 fi
 if [[ "${FILTER_REGEX_NEGATIVE-x}" == "x" ]] ; then
-  prompt FILTER_REGEX_NEGATIVE "Enter regex which must not match (or blank for none)" 0
+  prompt FILTER_REGEX_NEGATIVE "Enter regex which must not match (or blank for none)"
 fi
 if [[ "${FILTER_KEEP_NOHOSTNAME-x}" == "x" ]] ; then
   prompt FILTER_KEEP_NOHOSTNAME "Keep entries with IP address only?" 1
@@ -539,30 +569,30 @@ touch "${NMAP_LOG}"
 
 log DEBUG "TCP scanning opts: ${NMAP_TCP_OPTS[*]}"
 prompt proceed "Proceed with the TCP scan?" 1
-[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_tcp
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && do_stage "TCP" && scan_tcp
 
 log DEBUG "UDP scanning opts: ${NMAP_UDP_OPTS[*]}"
 prompt proceed "Proceed with the UDP scan?" 1
-[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_udp
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && do_stage "UDP" && scan_udp
 
 process_nmap_log
 
 ### SSL
 prompt proceed "Proceed with the SSL scan?" 1
-[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_ssl
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && do_stage "SSL" && scan_ssl
 
 ### FTP
 prompt proceed "Proceed with the FTP phase?" 1
-[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_ftp
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && do_stage "FTP" && scan_ftp
 
 ### SSH
-prompt proceed "Proceed with the ssh phase?" 1
-[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_ssh
+prompt proceed "Proceed with the SSH phase?" 1
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && do_stage "SSH" && scan_ssh
 
 ### SMTP
-prompt proceed "Proceed with the smtp phase?" 1
-[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_smtp
+prompt proceed "Proceed with the SMTP phase?" 1
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && do_stage "SMTP" && scan_smtp
 
 ### AQUATONE
 prompt proceed "Proceed with the Aquatone phase?" 1
-[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && scan_with_aquatone
+[[ "${proceed}" == 'y' || "${proceed}" == 'Y' ]] && do_stage "Aquatone" && scan_with_aquatone
